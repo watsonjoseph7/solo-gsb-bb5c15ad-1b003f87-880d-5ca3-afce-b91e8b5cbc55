@@ -275,10 +275,43 @@ CREATE TABLE checkpoints (
     )
 
 
+def _migration_4(conn: sqlite3.Connection, applied_at: str) -> None:
+    """Retention tombstones: dedup memory for readings removed by retention.
+
+    Checkpoint-safe retention deletes terminal readings outright, which used
+    to erase the idempotency record with them: an exact retry of a cleaned-up
+    reading no longer found its row and was re-quarantined (or, once the
+    source/session had sealed/closed, rejected with 409).  From now on every
+    actual delete records the reading's key ``(session_id, source_id, seq)``
+    and its canonical payload here, inside the same write transaction as the
+    ``DELETE``.  Ingest consults this table when a reported key has no live
+    row: an identical retry stays an idempotent duplicate (the reading is
+    never restored, the watermark never moves, no alert re-fires) while the
+    same key with a different payload still conflicts with 409.
+    """
+    conn.execute(
+        """
+CREATE TABLE deleted_readings (
+    session_id  TEXT NOT NULL REFERENCES sessions(session_id),
+    source_id   TEXT NOT NULL,
+    seq         INTEGER NOT NULL,
+    payload     TEXT,                -- canonical JSON of the deleted value
+    deleted_at  TEXT NOT NULL,       -- wall-clock time retention removed it
+    PRIMARY KEY (session_id, source_id, seq)
+)
+"""
+    )
+    conn.execute(
+        "INSERT INTO schema_migrations (version, applied_at) VALUES (4, ?)",
+        (applied_at,),
+    )
+
+
 MIGRATIONS: dict[int, Callable[[sqlite3.Connection, str], None]] = {
     1: _migration_1,
     2: _migration_2,
     3: _migration_3,
+    4: _migration_4,
 }
 LATEST_VERSION = max(MIGRATIONS)
 

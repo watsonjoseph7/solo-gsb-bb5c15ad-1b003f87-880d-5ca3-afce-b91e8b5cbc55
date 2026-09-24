@@ -13,7 +13,12 @@ Guarantees implemented here:
   published watermark can never be (re)published: it is diverted to the
   quarantine table and never mutates history.
 * Re-posting the same ``(source_id, seq)`` with the same payload is an
-  idempotent no-op; a different payload is a 409 conflict.
+  idempotent no-op; a different payload is a 409 conflict.  The same rule
+  holds for readings retention has already deleted: their keys and canonical
+  payloads live on in ``deleted_readings``, so an exact retry of a cleaned-up
+  reading is still counted as a duplicate (never restored, never
+  re-quarantined, never rejected because the source/session has since
+  sealed/closed) and a different payload under that key still conflicts.
 * A source may be sealed (its finite collection ended) with a
   ``final_observed_at`` no earlier than the largest event time already seen
   for it. Sealing the same value again is an idempotent no-op; sealing a
@@ -465,6 +470,27 @@ def ingest_batch(
                     )
                 # An exact retry stays an idempotent duplicate even after the
                 # source has been sealed (or the whole session closed).
+                duplicates += 1
+                continue
+
+            # No live row: retention may have cleaned the reading up.  Its
+            # tombstone keeps the dedup contract alive -- an identical retry
+            # is still an idempotent duplicate (the reading is not restored,
+            # the watermark does not move, no alert re-fires, and sealing or
+            # session closure must not turn the retry into a 409), while the
+            # same key carrying a different payload still conflicts.
+            tombstone = conn.execute(
+                "SELECT payload FROM deleted_readings"
+                " WHERE session_id = ? AND source_id = ? AND seq = ?",
+                key,
+            ).fetchone()
+            if tombstone is not None:
+                if tombstone["payload"] != payload:
+                    raise ConflictError(
+                        f"reading ({r['source_id']}, seq={r['seq']}) was removed"
+                        " by retention and cannot be re-reported with a"
+                        " different payload"
+                    )
                 duplicates += 1
                 continue
 

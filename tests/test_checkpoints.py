@@ -559,7 +559,7 @@ class TestCheckpointMigration:
         try:
             versions = [r[0] for r in conn.execute(
                 "SELECT version FROM schema_migrations ORDER BY version")]
-            assert versions == [1, 2, 3]
+            assert versions == [1, 2, 3, 4]
             names = {
                 r[0] for r in conn.execute(
                     "SELECT name FROM sqlite_master WHERE type='table'")

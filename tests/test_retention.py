@@ -728,17 +728,290 @@ class TestErrors:
         assert r.status_code == 422
 
 
-class TestNoSchemaChange:
-    def test_retention_introduces_no_new_migration(self, client):
-        # Retention is a delete over existing tables; the schema version and
-        # the readings/checkpoints tables stay exactly as before.
+class TestTombstoneMigration:
+    def test_retention_tombstones_are_migration_4(self, client):
+        # The dedup memory for cleaned-up readings is one versioned migration:
+        # a ``deleted_readings`` table keyed like the readings primary key.
         from app import database
 
         conn = sqlite3.connect(client.db_path)
         try:
             versions = [r[0] for r in conn.execute(
                 "SELECT version FROM schema_migrations ORDER BY version")]
-            assert versions == [1, 2, 3]
-            assert database.LATEST_VERSION == 3
+            assert versions == [1, 2, 3, 4]
+            assert database.LATEST_VERSION == 4
+            cols = {r[1] for r in conn.execute(
+                "PRAGMA table_info(deleted_readings)")}
+            assert cols == {
+                "session_id", "source_id", "seq", "payload", "deleted_at",
+            }
         finally:
             conn.close()
+
+    def test_v4_applies_to_legacy_database(self, tmp_path):
+        # A database left behind by the previous release (migrations 1-3
+        # applied, retention already possible) upgrades in place on startup.
+        from app import database
+        from app.database import utc_now
+        from app.time_utils import store_event_time
+
+        db_path = str(tmp_path / "legacy.db")
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        try:
+            conn.executescript(database.SCHEMA_V0)
+            conn.execute(
+                "CREATE TABLE schema_migrations ("
+                " version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)")
+            now = store_event_time(utc_now())
+            for version in (1, 2, 3):
+                database.MIGRATIONS[version](conn, now)
+            conn.execute(
+                "INSERT INTO sessions (session_id, source_ids,"
+                " allowed_lateness_seconds, created_at) VALUES (?, ?, 0, ?)",
+                ("legacy-s", '["a","b"]', now),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        database.init_db(db_path)
+        conn = sqlite3.connect(db_path)
+        try:
+            versions = [r[0] for r in conn.execute(
+                "SELECT version FROM schema_migrations ORDER BY version")]
+            assert versions == [1, 2, 3, 4]
+            names = {
+                r[0] for r in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'")
+            }
+            assert "deleted_readings" in names
+            # existing data untouched
+            assert conn.execute(
+                "SELECT COUNT(*) FROM sessions WHERE session_id = 'legacy-s'"
+            ).fetchone()[0] == 1
+        finally:
+            conn.close()
+
+        # Re-running init must not re-apply v4.
+        database.init_db(db_path)
+        conn = sqlite3.connect(db_path)
+        try:
+            assert conn.execute(
+                "SELECT COUNT(*) FROM schema_migrations WHERE version = 4"
+            ).fetchone()[0] == 1
+        finally:
+            conn.close()
+
+
+class TestRetryAfterCleanup:
+    """Retries of readings retention already deleted keep the dedup contract.
+
+    Before the fix, deleting a published/quarantined reading also erased its
+    idempotency record: an identical retry found no row and was quarantined
+    again (or, once the source had sealed, rejected with 409).
+    """
+
+    def test_retry_of_deleted_published_reading_is_a_duplicate(self, client):
+        sid = create_session(client)
+        setup_ladder(client, sid)
+        assert retention(client, sid, "2026-01-01T00:00:35Z", False).json()[
+            "deleted"] == 4
+        # a@1 (:00) and b@1 (:10) are gone from the stream; re-reporting the
+        # exact same readings must be a no-op, not a re-quarantine.
+        r = report(client, sid, [
+            {"source_id": "a", "seq": 1, "observed_at": T0, "value": 1},
+            {"source_id": "b", "seq": 1, "observed_at": "2026-01-01T00:00:10Z",
+             "value": 2},
+        ])
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["duplicates"] == 2
+        assert body["quarantined"] == 0
+        assert body["published_now"] == 0
+        # nothing is restored: stream, quarantine and watermark stay as after
+        # the cleanup
+        assert keys(full_stream(client, sid)) == [("a", 3), ("b", 3)]
+        assert client.get(f"/sessions/{sid}/quarantine").json()["readings"] == []
+        state = client.get(f"/sessions/{sid}").json()
+        assert state["published_watermark"] == "2026-01-01T00:01:00Z"
+
+    def test_retry_of_deleted_quarantined_reading_is_a_duplicate(self, client):
+        sid = create_session(client)
+        setup_ladder(client, sid)
+        late = {"source_id": "a", "seq": 9,
+                "observed_at": "2026-01-01T00:00:05Z", "value": 9}
+        assert report(client, sid, [late]).json()["quarantined"] == 1
+        assert retention(client, sid, "2026-01-01T00:00:35Z", False).json()[
+            "deleted"] == 5
+        assert client.get(f"/sessions/{sid}/quarantine").json()["readings"] == []
+        # the exact retry must not re-enter the quarantine area
+        r = report(client, sid, [late])
+        assert r.status_code == 200, r.text
+        assert r.json()["duplicates"] == 1
+        assert r.json()["quarantined"] == 0
+        assert client.get(f"/sessions/{sid}/quarantine").json()["readings"] == []
+
+    def test_same_key_different_payload_after_cleanup_conflicts(self, client):
+        sid = create_session(client)
+        setup_ladder(client, sid)
+        retention(client, sid, "2026-01-01T00:00:35Z", False)
+        r = report(client, sid, [
+            {"source_id": "a", "seq": 1, "observed_at": T0, "value": 999}])
+        assert r.status_code == 409, r.text
+        # the failed batch changed nothing
+        assert keys(full_stream(client, sid)) == [("a", 3), ("b", 3)]
+        assert client.get(f"/sessions/{sid}/quarantine").json()["readings"] == []
+
+    def test_mixed_batch_with_conflicting_retry_rolls_back(self, client):
+        sid = create_session(client)
+        setup_ladder(client, sid)
+        retention(client, sid, "2026-01-01T00:00:35Z", False)
+        before = client.get(f"/sessions/{sid}").json()
+        # one brand-new reading plus one conflicting retry of a deleted key:
+        # the 409 must roll the whole batch back
+        r = report(client, sid, [
+            {"source_id": "b", "seq": 5, "observed_at": "2026-01-01T00:01:20Z",
+             "value": 10},
+            {"source_id": "a", "seq": 1, "observed_at": T0, "value": 999},
+        ])
+        assert r.status_code == 409, r.text
+        after = client.get(f"/sessions/{sid}").json()
+        assert after == before
+        assert keys(full_stream(client, sid)) == [("a", 3), ("b", 3)]
+
+    def test_retry_after_cleanup_survives_source_seal(self, client):
+        # The reported bug: a cleaned-up reading's exact retry was rejected
+        # once its source had sealed.
+        sid = create_session(client)
+        setup_ladder(client, sid)
+        retention(client, sid, "2026-01-01T00:00:35Z", False)
+        seal(client, sid, "a", "2026-01-01T00:01:00Z")
+        r = report(client, sid, [
+            {"source_id": "a", "seq": 1, "observed_at": T0, "value": 1}])
+        assert r.status_code == 200, r.text
+        assert r.json()["duplicates"] == 1
+        # a genuinely new key of the sealed source is still rejected
+        r = report(client, sid, [
+            {"source_id": "a", "seq": 42, "observed_at": T0, "value": 1}])
+        assert r.status_code == 409, r.text
+
+    def test_retry_after_cleanup_survives_session_close(self, client):
+        sid = create_session(client)
+        setup_ladder(client, sid)
+        retention(client, sid, "2026-01-01T00:00:35Z", False)
+        seal(client, sid, "a", "2026-01-01T00:01:00Z")
+        seal(client, sid, "b", "2026-01-01T00:01:10Z")
+        assert client.get(f"/sessions/{sid}").json()["closed"] is True
+        r = report(client, sid, [
+            {"source_id": "a", "seq": 1, "observed_at": T0, "value": 1},
+            {"source_id": "b", "seq": 1, "observed_at": "2026-01-01T00:00:10Z",
+             "value": 2},
+        ])
+        assert r.status_code == 200, r.text
+        assert r.json()["duplicates"] == 2
+        # different payload under a tombstoned key still conflicts, even closed
+        r = report(client, sid, [
+            {"source_id": "a", "seq": 1, "observed_at": T0, "value": 2}])
+        assert r.status_code == 409, r.text
+
+    def test_retry_does_not_move_watermark_or_refire_alerts(self, client):
+        sid = create_session(client)
+        setup_ladder(client, sid)
+        rule = client.post(f"/sessions/{sid}/alert-rules", json={
+            "rule_id": "a-low", "source_id": "a", "direction": "below",
+            "enter_threshold": 100, "recover_threshold": 200,
+            "enter_consecutive": 1, "recover_consecutive": 1,
+        })
+        assert rule.status_code == 201
+        history_before = client.get(f"/sessions/{sid}/alerts/history").json()
+        current_before = client.get(f"/sessions/{sid}/alerts/current").json()
+        retention(client, sid, "2026-01-01T00:00:35Z", False)
+        # retrying the deleted low values must not re-drive the state machine
+        r = report(client, sid, [
+            {"source_id": "a", "seq": 1, "observed_at": T0, "value": 1},
+            {"source_id": "a", "seq": 2, "observed_at": "2026-01-01T00:00:20Z",
+             "value": 3},
+        ])
+        assert r.json()["duplicates"] == 2
+        assert r.json()["published_now"] == 0
+        assert r.json()["published_total"] == 2
+        assert client.get(f"/sessions/{sid}/alerts/history").json() == history_before
+        assert client.get(f"/sessions/{sid}/alerts/current").json() == current_before
+        state = client.get(f"/sessions/{sid}").json()
+        assert state["published_watermark"] == "2026-01-01T00:01:00Z"
+        assert state["sources"][0]["max_observed_at"] == "2026-01-01T00:01:00Z"
+
+    def test_retry_leaves_checkpoint_resume_unchanged(self, client):
+        sid = create_session(client)
+        report(client, sid, [
+            {"source_id": "a", "seq": 1, "observed_at": T0},
+            {"source_id": "b", "seq": 1, "observed_at": "2026-01-01T00:00:10Z"},
+        ])
+        report(client, sid, [
+            {"source_id": "a", "seq": 2, "observed_at": "2026-01-01T00:00:20Z"}])
+        report(client, sid, [
+            {"source_id": "b", "seq": 2, "observed_at": "2026-01-01T00:00:30Z"}])
+        make_checkpoint(client, sid, "cp")  # boundary b@:10
+        setup_ladder(client, sid)
+        retention(client, sid, "2026-01-01T00:00:35Z", False)
+        resume_before = keys(full_checkpoint_stream(client, sid, "cp"))
+        # a@1 was first reported without a value; the identical retry is a
+        # duplicate and the checkpoint resume window is untouched
+        r = report(client, sid, [
+            {"source_id": "a", "seq": 1, "observed_at": T0}])
+        assert r.json()["duplicates"] == 1
+        assert keys(full_checkpoint_stream(client, sid, "cp")) == resume_before
+
+    def test_tombstone_records_key_and_canonical_payload(self, client):
+        sid = create_session(client)
+        setup_ladder(client, sid)
+        report(client, sid, [
+            {"source_id": "a", "seq": 9, "observed_at": "2026-01-01T00:00:05Z",
+             "value": {"b": 1, "a": [2, 3]}}])
+        retention(client, sid, "2026-01-01T00:00:35Z", False)
+        conn = sqlite3.connect(client.db_path)
+        try:
+            rows = conn.execute(
+                "SELECT source_id, seq, payload FROM deleted_readings"
+                " WHERE session_id = ? ORDER BY source_id, seq", (sid,)
+            ).fetchall()
+        finally:
+            conn.close()
+        # 4 published + 1 quarantined rows were deleted; each left exactly
+        # one tombstone with the canonical (key-sorted) payload
+        assert [(r[0], r[1]) for r in rows] == [
+            ("a", 1), ("a", 2), ("a", 9), ("b", 1), ("b", 2)]
+        by_key = {(r[0], r[1]): r[2] for r in rows}
+        assert by_key[("a", 9)] == '{"a":[2,3],"b":1}'
+        assert by_key[("a", 1)] == "1"
+
+    def test_tombstone_rolls_back_with_a_failed_delete(self, client):
+        sid = create_session(client)
+        setup_ladder(client, sid)
+        conn = sqlite3.connect(client.db_path)
+        try:
+            conn.execute(
+                "CREATE TRIGGER fail_retention DELETE ON readings"
+                " BEGIN SELECT RAISE(ABORT, 'synthetic failure'); END")
+            conn.commit()
+        finally:
+            conn.close()
+        r = retention(client, sid, "2026-01-01T00:00:35Z", False)
+        assert r.status_code == 500, r.text
+        conn = sqlite3.connect(client.db_path)
+        try:
+            assert conn.execute(
+                "SELECT COUNT(*) FROM deleted_readings WHERE session_id = ?",
+                (sid,),
+            ).fetchone()[0] == 0
+            conn.execute("DROP TRIGGER fail_retention")
+            conn.commit()
+        finally:
+            conn.close()
+        # after the fault clears the delete + tombstones commit together
+        assert retention(client, sid, "2026-01-01T00:00:35Z", False).json()[
+            "deleted"] == 4
+        r = report(client, sid, [
+            {"source_id": "a", "seq": 1, "observed_at": T0, "value": 1}])
+        assert r.json()["duplicates"] == 1
