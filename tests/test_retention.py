@@ -728,17 +728,22 @@ class TestErrors:
         assert r.status_code == 422
 
 
-class TestNoSchemaChange:
-    def test_retention_introduces_no_new_migration(self, client):
-        # Retention is a delete over existing tables; the schema version and
-        # the readings/checkpoints tables stay exactly as before.
+class TestTombstoneMigration:
+    def test_retention_tombstones_migration_is_applied(self, client):
+        # The tombstone table backing post-cleanup dedup arrives as a
+        # versioned startup migration on top of the pre-existing schema.
         from app import database
 
         conn = sqlite3.connect(client.db_path)
         try:
             versions = [r[0] for r in conn.execute(
                 "SELECT version FROM schema_migrations ORDER BY version")]
-            assert versions == [1, 2, 3]
-            assert database.LATEST_VERSION == 3
+            assert versions == [1, 2, 3, 4]
+            assert database.LATEST_VERSION == 4
+            cols = {r[1] for r in conn.execute(
+                "PRAGMA table_info(retention_tombstones)")}
+            assert cols == {
+                "session_id", "source_id", "seq", "payload_digest", "deleted_at",
+            }
         finally:
             conn.close()

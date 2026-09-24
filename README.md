@@ -30,7 +30,9 @@ buffered 读数按既定全局顺序一次性发布（**尾流发布**）、推�
 而已发布候选中凡是**会话最早检查点仍可能在续读时读到**的一律保留，并在响应中返回该
 “检查点保护边界”。`dry_run=true` 只报告候选/保留/可删除数量，`dry_run=false` 在
 **同一个 `BEGIN IMMEDIATE` 写事务**内原子删除；重复请求幂等，失败整体回滚，
-且不改变水位线、告警与检查点的任何语义。
+且不改变水位线、告警与检查点的任何语义。每条被实际删除的读数都会在删除所在的
+同一事务内留下一条**判重墓碑**（`(session_id, source_id, seq)` + 规范化 payload 摘要），
+因此清理之后的同 key 重试仍按幂等判重处理（见“时间线语义”第 12 条）。
 
 此外，**隔离影响预演**接口 `POST /sessions/{session_id}/quarantine-audit` 对隔离区读数做
 只读“假如按事件时间插入已发布流”的推演：在**同一个 SQLite 读快照**内，按确定顺序
@@ -104,7 +106,7 @@ docker compose up --build
 ```bash
 python3 -m pip install -r requirements.txt
 SENSOR_DB_PATH=./sensors.db uvicorn app.main:app --reload --port 8000
-pytest -q        # 运行 390 个端到端行为测试（需 pytest、httpx）
+pytest -q        # 运行 407 个端到端行为测试（需 pytest、httpx）
 ```
 
 ## 时间线语义
@@ -137,6 +139,13 @@ pytest -q        # 运行 390 个端到端行为测试（需 pytest、httpx）
 11. **同一把写锁**：封存与上报都在同一串行化写事务内执行，因此“封存与新读数并发”只会得到
     两种线性化结果之一——读数先落库（封存照常进行），或封存先生效（新读数 409），
     不会出现封存后仍混入新读数、或尾流发布遗漏/重复读数的竞态。
+12. **清理后的重试判重（retention tombstone）**：retention 每实际删除一条读数，都在删除所在的
+    同一事务内向 `retention_tombstones` 写入一条墓碑（`(session_id, source_id, seq)` 主键 +
+    规范化 payload 的 SHA-256 摘要）。之后上报在写入前先查现存行、再查墓碑：
+    同 key 同值 → 仍计为 `duplicates` 的空操作——**不恢复读数、不推进水位线、不再次触发
+    告警、也不会重新进入隔离区**；同 key 异值 → 409，混合批次整体回滚。即使来源已封存、
+    会话已关闭，被清理 key 的相同重试依然计为 `duplicates` 而不是被拒绝；
+    检查点续读结果不受任何影响。
 
 ## 告警状态机语义
 
@@ -241,7 +250,9 @@ curl -s -X POST localhost:8000/sessions/lab-1/readings \
 
 错误码：未知来源/非法时间/空批次 → 400；字段结构错误（缺字段、`seq<0` 等）→ 422；
 同 key 不同 payload、向**已封存来源**或**已关闭会话**上报新 key → 409；会话不存在 → 404。
-注意：来源封存/会话关闭后，对完全相同既有读数的重试仍正常返回 200 并计入 `duplicates`。
+注意：来源封存/会话关闭后，对完全相同既有读数的重试仍正常返回 200 并计入 `duplicates`；
+被 retention 清理掉的读数同理——同 key 同值重试计为 `duplicates`（不恢复、不重新隔离），
+同 key 异值 → 409（见“时间线语义”第 12 条）。
 
 ### 3. 封存来源（声明采集结束）
 
@@ -627,12 +638,20 @@ curl -s -X POST localhost:8000/sessions/lab-1/retention \
 `BEGIN IMMEDIATE` 写事务**内完成，`deleted` 返回实际删除行数（等于该次调用的
 `deletable`），任何失败都整体回滚、数据不变。
 
+**判重墓碑**：每一条被实际删除的读数，都会在同一事务内向 `retention_tombstones`
+写入一条墓碑（`(session_id, source_id, seq)` 主键、规范化 payload 的 SHA-256 摘要、
+删除时刻）；dry run 与受检查点保护而保留的读数**不会**产生墓碑。此后上报同 key
+读数时，服务在写入前先查墓碑：同值重试计为 `duplicates`（读数不会被恢复、不会重新
+进入隔离区、水位线与告警不受影响），异值重试返回 409 且整批回滚——即使该来源已封存
+或会话已关闭也是如此。
+
 - **幂等**：相同请求重复提交，候选已在上次删除，第二次返回 `deleted=0`、`deletable=0`，
-  且再无副作用（两个相同执行并发也被串行化为“一次删除 + 一次空操作”）。
-- **语义不变**：清理只删除 `readings` 行；不写 `sessions` / `session_sources` /
-  告警表 / `checkpoints`，因此已发布水位线、有效水位线、来源封存/关闭状态、告警当前态
-  与历史事件、检查点不可变快照及续读结果全部保持不变（删除只可能让 `/stream` 变短，
-  受保护的检查点续读窗口一条不少）。
+  且再无副作用（两个相同执行并发也被串行化为“一次删除 + 一次空操作”）；墓碑在后续
+  清理中原样保留，重试判重长期有效。
+- **语义不变**：清理只删除 `readings` 行并在同事务写入墓碑表；不写 `sessions` /
+  `session_sources` / 告警表 / `checkpoints`，因此已发布水位线、有效水位线、来源封存/
+  关闭状态、告警当前态与历史事件、检查点不可变快照及续读结果全部保持不变（删除只可能让
+  `/stream` 变短，受保护的检查点续读窗口一条不少）。
 - `open` 与 `closed` 会话均可清理；会话不存在 → 404；`cutoff` 非法/为空 → 400/422。
 
 ```bash
@@ -1009,6 +1028,10 @@ curl -s 'localhost:8000/sessions/lab-1/local-spikes?source_id=thermometer-a&from
   保存创建时同一快照内的发布流位置（`stream_offset` 与最后一条已发布读数的
   `(last_observed_at, last_source_id, last_seq)` 键）和 `published_watermark`；
   检查点行不可变，后续发布/封存/关闭均不改写它。
+- **v4**：清理判重墓碑——新增 `retention_tombstones` 表（`(session_id, source_id, seq)`
+  主键），保存每条被 retention 实际删除读数的规范化 payload 摘要（SHA-256）与删除时刻；
+  墓碑与删除在同一事务内提交，上报据此在写入前判重（同值 → `duplicates`，异值 → 409），
+  老库启动时自动补齐该表、数据不变。
 
 ## 端到端示例（来源封存与尾流发布）
 
@@ -1089,6 +1112,7 @@ curl -s 'localhost:8000/sessions/lab-1/local-spikes?source_id=thermometer-a&from
 │   ├── test_checkpoints.py  # 检查点创建/幂等/409/继续读取分页/不可变/迁移测试（39 个）
 │   ├── test_release_plan.py # 释放计划目标水位线/逐来源推进/封存不可达/422/409/并发只读测试（19 个）
 │   ├── test_retention.py    # 检查点安全清理：dry_run/保护边界/跨轮清理偏移倒挂/原子删除/幂等/不改变既有语义测试（31 个）
+│   ├── test_retention_retry.py # 清理后重试判重：墓碑判重/异值 409/整批回滚/封存关闭后重试/不推进水位线告警/检查点不变/迁移测试（17 个）
 │   ├── test_quarantine_audit.py # 隔离影响预演：插入位置/邻居时间差/检查点影响/跨轮清理/过滤/400/只读测试（45 个）
 │   └── test_source_gaps.py # 来源缺口扫描：相邻配对/严格阈值/微秒精度/闭区间/游标分页/400/只读测试（29 个）
 │   └── test_arrival_latency.py # 到达延迟剖析：逐来源统计/负延迟/微秒精度/闭区间/空来源/400/只读/单快照测试（19 个）

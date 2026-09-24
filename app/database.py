@@ -275,10 +275,46 @@ CREATE TABLE checkpoints (
     )
 
 
+def _migration_4(conn: sqlite3.Connection, applied_at: str) -> None:
+    """Retention tombstones: a deleted reading keeps its dedup identity.
+
+    Retention removes published/quarantined rows outright.  Without a record
+    of what was removed, a later retry of the same ``(source_id, seq)`` looks
+    like a brand-new key to ingestion: it re-enters quarantine behind the
+    watermark, or is rejected outright once the source is sealed / the
+    session closed.  Every reading actually deleted by retention therefore
+    leaves a tombstone here, written in the same serialised transaction as
+    the delete: the reading key plus a digest of its canonical payload.
+    Ingestion consults the tombstones before admitting an unseen key -- same
+    key with the same payload is an idempotent duplicate (nothing is
+    restored, republished or re-alerted), same key with a different payload
+    is a 409 conflict.
+    """
+    conn.execute(
+        """
+CREATE TABLE retention_tombstones (
+    session_id     TEXT NOT NULL REFERENCES sessions(session_id),
+    source_id      TEXT NOT NULL,
+    seq            INTEGER NOT NULL,
+    -- SHA-256 (hex) of the deleted reading's canonical JSON payload.
+    payload_digest TEXT NOT NULL,
+    -- Wall-clock time of the retention delete that created the tombstone.
+    deleted_at     TEXT NOT NULL,
+    PRIMARY KEY (session_id, source_id, seq)
+)
+"""
+    )
+    conn.execute(
+        "INSERT INTO schema_migrations (version, applied_at) VALUES (4, ?)",
+        (applied_at,),
+    )
+
+
 MIGRATIONS: dict[int, Callable[[sqlite3.Connection, str], None]] = {
     1: _migration_1,
     2: _migration_2,
     3: _migration_3,
+    4: _migration_4,
 }
 LATEST_VERSION = max(MIGRATIONS)
 

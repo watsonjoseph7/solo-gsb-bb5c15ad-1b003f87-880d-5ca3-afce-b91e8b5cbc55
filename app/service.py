@@ -14,6 +14,11 @@ Guarantees implemented here:
   quarantine table and never mutates history.
 * Re-posting the same ``(source_id, seq)`` with the same payload is an
   idempotent no-op; a different payload is a 409 conflict.
+* A reading deleted by retention leaves a tombstone (key + canonical-payload
+  digest) written in the delete's own transaction, so the dedup rule above
+  keeps holding for cleaned-up keys: the same payload stays an idempotent
+  duplicate that restores nothing, moves no watermark and re-triggers no
+  alert; a different payload is a 409 conflict.
 * A source may be sealed (its finite collection ended) with a
   ``final_observed_at`` no earlier than the largest event time already seen
   for it. Sealing the same value again is an idempotent no-op; sealing a
@@ -29,6 +34,7 @@ Guarantees implemented here:
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 import uuid
@@ -54,6 +60,7 @@ __all__ = [
     "BadRequestError",
     "ConflictError",
     "canonical_payload",
+    "payload_digest",
     "create_session",
     "get_session",
     "seal_source",
@@ -75,6 +82,18 @@ def canonical_payload(value: Any) -> str:
     ``str()`` coercion).
     """
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def payload_digest(payload: str) -> str:
+    """Stable digest of a canonical payload, stored in retention tombstones.
+
+    Retention deletes the readings row but must remember which value each
+    deleted key carried, so a later retry can be told apart from a
+    conflicting re-report.  The digest of the canonical JSON form suffices:
+    identical payloads digest identically, different ones (practically)
+    never collide.
+    """
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def _load_session(conn: sqlite3.Connection, session_id: str) -> sqlite3.Row:
@@ -465,6 +484,27 @@ def ingest_batch(
                     )
                 # An exact retry stays an idempotent duplicate even after the
                 # source has been sealed (or the whole session closed).
+                duplicates += 1
+                continue
+
+            # A key whose reading was deleted by retention keeps its dedup
+            # identity via the tombstone written in the delete's transaction.
+            tombstone = conn.execute(
+                "SELECT payload_digest FROM retention_tombstones"
+                " WHERE session_id = ? AND source_id = ? AND seq = ?",
+                key,
+            ).fetchone()
+            if tombstone is not None:
+                if tombstone["payload_digest"] != payload_digest(payload):
+                    # Same key, different measurement than the deleted row.
+                    raise ConflictError(
+                        f"reading ({r['source_id']}, seq={r['seq']}) was deleted"
+                        " by retention with a different payload"
+                    )
+                # Exact retry of a cleaned-up reading: idempotent duplicate.
+                # The reading is not restored, the watermark does not move
+                # and no alert is re-triggered -- nothing is written, even
+                # when the source is sealed or the session closed.
                 duplicates += 1
                 continue
 

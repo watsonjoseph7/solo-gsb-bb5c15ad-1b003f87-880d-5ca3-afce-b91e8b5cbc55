@@ -37,19 +37,22 @@ resuming from it starts at the beginning.
 Dry runs derive all counts in one deferred read snapshot and write nothing.
 Confirmation executes the candidate deletes in a single serialised
 ``BEGIN IMMEDIATE`` write transaction, so the report and the delete are one
-atomic unit: any failure rolls the transaction back unchanged.  Retention
-never writes to ``sessions``, ``session_sources``, the alert tables or
-``checkpoints`` -- watermarks, alerts and checkpoint semantics are unchanged.
-Repeating the same request is idempotent: once the candidates are gone the
-second call simply reports zero deletable rows.
+atomic unit: any failure rolls the transaction back unchanged.  Every row
+actually deleted leaves a **tombstone** in ``retention_tombstones`` (key plus
+canonical-payload digest) inside that same transaction, so a later retry of
+the same key keeps its dedup identity instead of looking like a brand-new
+reading.  Retention never writes to ``sessions``, ``session_sources``, the
+alert tables or ``checkpoints`` -- watermarks, alerts and checkpoint
+semantics are unchanged.  Repeating the same request is idempotent: once the
+candidates are gone the second call simply reports zero deletable rows.
 """
 from __future__ import annotations
 
 import sqlite3
 from typing import Any, Optional
 
-from .database import read_transaction, transaction
-from .service import _load_session
+from .database import read_transaction, transaction, utc_now
+from .service import _load_session, payload_digest
 from .time_utils import format_event_time, parse_event_time, store_event_time
 
 __all__ = ["apply_retention"]
@@ -106,6 +109,37 @@ def _count(conn: sqlite3.Connection, where: str, *params: Any) -> int:
     ).fetchone()["c"]
 
 
+def _record_tombstones(
+    conn: sqlite3.Connection, session_id: str, rows: list[sqlite3.Row]
+) -> None:
+    """Persist the dedup identity of every row this transaction deletes.
+
+    Runs inside the delete's own serialised transaction, so a tombstone
+    exists exactly when its reading is gone: a crash rolls both back
+    together.  A later retry of the same key is matched against the stored
+    payload digest (same payload -> idempotent duplicate, different -> 409)
+    instead of being admitted as a brand-new reading.
+    """
+    if not rows:
+        return
+    deleted_at = store_event_time(utc_now())
+    conn.executemany(
+        "INSERT OR REPLACE INTO retention_tombstones"
+        " (session_id, source_id, seq, payload_digest, deleted_at)"
+        " VALUES (?, ?, ?, ?, ?)",
+        [
+            (
+                session_id,
+                row["source_id"],
+                row["seq"],
+                payload_digest(row["payload"]),
+                deleted_at,
+            )
+            for row in rows
+        ],
+    )
+
+
 # ---------------------------------------------------------------------------
 # retention report / delete
 # ---------------------------------------------------------------------------
@@ -141,11 +175,21 @@ def apply_retention(
         earliest = _earliest_checkpoint(conn, session_id)
         counts = _compute_counts(conn, session_id, cutoff_store, earliest)
 
+        # The doomed rows are selected with the exact delete predicates first,
+        # so each one can leave its tombstone in this same transaction.
+        doomed: list[sqlite3.Row] = []
+
         # Every quarantined candidate is unreachable from the published stream
         # and can be removed outright.
+        quarantined_where = (
+            "session_id = ? AND status = 'quarantined' AND observed_at < ?"
+        )
+        doomed += conn.execute(
+            f"SELECT source_id, seq, payload FROM readings WHERE {quarantined_where}",
+            (session_id, cutoff_store),
+        ).fetchall()
         cur = conn.execute(
-            "DELETE FROM readings WHERE session_id = ?"
-            " AND status = 'quarantined' AND observed_at < ?",
+            f"DELETE FROM readings WHERE {quarantined_where}",
             (session_id, cutoff_store),
         )
         deleted_quarantined = cur.rowcount
@@ -155,30 +199,44 @@ def apply_retention(
         # the captured keyset).  The boundary keyset itself is already covered
         # by the checkpoint, so it is deleted like everything before it.
         if earliest is None:
-            cur = conn.execute(
-                "DELETE FROM readings WHERE session_id = ?"
-                " AND status = 'published' AND observed_at < ?",
-                (session_id, cutoff_store),
+            published_where = (
+                "session_id = ? AND status = 'published' AND observed_at < ?"
             )
-            deleted_published = cur.rowcount
+            published_params: tuple[Any, ...] = (session_id, cutoff_store)
         elif earliest["last_observed_at"] is None:
             # Empty-stream checkpoint: its resume starts at the very first
             # reading, so every published row is protected.
-            deleted_published = 0
+            published_where = ""
+            published_params = ()
         else:
             b_ts = earliest["last_observed_at"]
             b_src = earliest["last_source_id"]
             b_seq = earliest["last_seq"]
-            cur = conn.execute(
-                "DELETE FROM readings WHERE session_id = ?"
-                " AND status = 'published' AND observed_at < ?"
+            published_where = (
+                "session_id = ? AND status = 'published' AND observed_at < ?"
                 " AND NOT (observed_at > ?"
                 " OR (observed_at = ? AND source_id > ?)"
-                " OR (observed_at = ? AND source_id = ? AND seq > ?))",
-                (session_id, cutoff_store,
-                 b_ts, b_ts, b_src, b_ts, b_src, b_seq),
+                " OR (observed_at = ? AND source_id = ? AND seq > ?))"
+            )
+            published_params = (
+                session_id, cutoff_store,
+                b_ts, b_ts, b_src, b_ts, b_src, b_seq,
+            )
+        if published_where:
+            doomed += conn.execute(
+                f"SELECT source_id, seq, payload FROM readings"
+                f" WHERE {published_where}",
+                published_params,
+            ).fetchall()
+            cur = conn.execute(
+                f"DELETE FROM readings WHERE {published_where}",
+                published_params,
             )
             deleted_published = cur.rowcount
+
+        # Tombstones for the rows actually removed, in the same transaction:
+        # a later retry of a deleted key is matched against these digests.
+        _record_tombstones(conn, session_id, doomed)
 
         protection = _checkpoint_protection(earliest) if earliest else None
 
